@@ -1,0 +1,6 @@
+{
+  "name": "AI Shorts Editor",
+  "description": "Personal AI-powered automatic vertical video editor turning voiceovers, raw footage, images, and scripts into polished 9:16 MP4 videos locally with Gemini and FFmpeg.wasm.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
