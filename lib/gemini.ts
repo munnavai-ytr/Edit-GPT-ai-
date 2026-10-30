@@ -1,37 +1,87 @@
 import {GoogleGenAI} from '@google/genai';
+import type {NextRequest} from 'next/server';
 
-export const ALLOWED_DIRECTOR_MODELS = [
-  'gemini-3.8-flash',
-  'gemini-3.1-flash-lite',
+export const SELECTABLE_DIRECTOR_MODELS = [
+  {
+    id: 'gemini-3.8-flash',
+    label: 'gemini-3.8-flash (Balanced Multimodal & Reasoning)',
+  },
+  {
+    id: 'gemini-3.1-flash-lite',
+    label: 'gemini-3.1-flash-lite (Fast High-Quota Free Tier)',
+  },
+  {
+    id: 'gemini-flash-latest',
+    label: 'gemini-flash-latest (Latest Flash Alias)',
+  },
+  {
+    id: 'gemini-4-argon',
+    label: 'gemini-4-argon (Advanced Pro Reasoning · Requires Paid BYOK Key)',
+  },
 ] as const;
 
 export const TRANSCRIPTION_MODEL = 'gemini-3.5-transcribe' as const;
 
-export type DirectorModelId = (typeof ALLOWED_DIRECTOR_MODELS)[number];
+const DEPRECATED_MODELS = new Set([
+  'gemini-1.5-flash',
+  'gemini-1.5-pro',
+  'gemini-pro',
+  'gemini-2.0-flash',
+  'gemini-2.0-pro',
+  'gemini-2.0-flash-thinking',
+]);
 
-export function resolveDirectorModel(input?: string): DirectorModelId {
-  if (input === 'gemini-3.1-flash-lite') return 'gemini-3.1-flash-lite';
-  return 'gemini-3.8-flash';
+export function resolveDirectorModel(input?: string): string {
+  const cleaned = input?.trim();
+  if (!cleaned || DEPRECATED_MODELS.has(cleaned)) {
+    return 'gemini-3.8-flash';
+  }
+  return cleaned;
 }
 
-export function getServerGeminiClient(): GoogleGenAI {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey || apiKey === 'MY_GEMINI_API_KEY' || apiKey.trim() === '') {
+export function resolveTranscriptionModel(input?: string): string {
+  const cleaned = input?.trim();
+  if (!cleaned || DEPRECATED_MODELS.has(cleaned)) {
+    return TRANSCRIPTION_MODEL;
+  }
+  return cleaned;
+}
+
+export function getServerGeminiClient(req?: NextRequest): {
+  ai: GoogleGenAI;
+  keySource: 'byok' | 'server_env';
+} {
+  const headerKey = req?.headers.get('x-gemini-api-key')?.trim();
+  const envKey = process.env.GEMINI_API_KEY?.trim();
+
+  const useByok = Boolean(headerKey && headerKey.length > 5);
+  const resolvedKey = useByok
+    ? headerKey!
+    : envKey && envKey !== 'MY_GEMINI_API_KEY'
+      ? envKey
+      : '';
+
+  if (!resolvedKey) {
     throw new GeminiConfigError(
-      'GEMINI_API_KEY is missing on the server. Configure your key in Settings > Secrets.',
+      'No Gemini API key is configured. Open the API Key Manager to add your Gemini API key.',
       401,
       'MISSING_API_KEY'
     );
   }
 
-  return new GoogleGenAI({
-    apiKey,
+  const ai = new GoogleGenAI({
+    apiKey: resolvedKey,
     httpOptions: {
       headers: {
         'User-Agent': 'aistudio-build',
       },
     },
   });
+
+  return {
+    ai,
+    keySource: useByok ? 'byok' : 'server_env',
+  };
 }
 
 export class GeminiConfigError extends Error {
@@ -56,17 +106,13 @@ export async function withGeminiRetry<T>(
     } catch (err: unknown) {
       lastError = err;
       const msg = err instanceof Error ? err.message : String(err);
-      const isRateLimit =
-        msg.includes('429') ||
-        msg.includes('RESOURCE_EXHAUSTED') ||
-        msg.includes('quota');
       const isTransient =
         msg.includes('503') ||
         msg.includes('UNAVAILABLE') ||
         msg.includes('fetch failed');
 
-      if ((isRateLimit || isTransient) && attempt < maxRetries) {
-        const delayMs = 900 * Math.pow(2, attempt);
+      if (isTransient && attempt < maxRetries) {
+        const delayMs = 800 * Math.pow(2, attempt);
         await new Promise((r) => setTimeout(r, delayMs));
         continue;
       }
@@ -83,10 +129,12 @@ export function formatGeminiError(err: unknown): GeminiConfigError {
   if (
     rawMessage.includes('API_KEY_INVALID') ||
     rawMessage.includes('PERMISSION_DENIED') ||
-    rawMessage.includes('403')
+    rawMessage.includes('API key not valid') ||
+    rawMessage.includes('403') ||
+    rawMessage.includes('401')
   ) {
     return new GeminiConfigError(
-      'Gemini API key was rejected or lacks permission. Verify your key in the Settings > Secrets panel.',
+      'Invalid or unauthorized Gemini API key. Open API Key Manager to replace or test your key.',
       403,
       'INVALID_API_KEY'
     );
@@ -98,7 +146,7 @@ export function formatGeminiError(err: unknown): GeminiConfigError {
     rawMessage.toLowerCase().includes('quota')
   ) {
     return new GeminiConfigError(
-      'Gemini free-tier rate limit reached. Wait 30–60 seconds and click Retry, or switch to gemini-3.1-flash-lite in Settings.',
+      'Quota or rate limit exceeded for the current Gemini API key. Switch to another key or select gemini-3.1-flash-lite in API Key Manager.',
       429,
       'RATE_LIMITED'
     );
@@ -106,14 +154,14 @@ export function formatGeminiError(err: unknown): GeminiConfigError {
 
   if (rawMessage.includes('404') || rawMessage.includes('NOT_FOUND')) {
     return new GeminiConfigError(
-      'Requested Gemini model was not found. Reset the model selection in Settings.',
+      'Selected Gemini model is unavailable for this API key. Choose gemini-3.8-flash or gemini-3.1-flash-lite in API Key Manager.',
       404,
       'MODEL_NOT_FOUND'
     );
   }
 
   return new GeminiConfigError(
-    `Gemini API error: ${rawMessage.slice(0, 280)}`,
+    `Gemini request failed: ${rawMessage.replace(/key=[^&\s]+/gi, 'key=[REDACTED]').slice(0, 260)}`,
     500,
     'GEMINI_REQUEST_FAILED'
   );

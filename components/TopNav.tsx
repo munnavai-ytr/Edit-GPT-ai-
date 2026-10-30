@@ -4,11 +4,12 @@ import React from 'react';
 import {
   Clapperboard,
   FolderKanban,
+  KeyRound,
   PlaySquare,
   Plus,
-  Settings,
   Sliders,
 } from 'lucide-react';
+import type {SettingsModalTab} from './SettingsModal';
 
 export type WorkspaceTab = 'dashboard' | 'create' | 'workspace' | 'preview';
 
@@ -16,9 +17,10 @@ interface TopNavProps {
   activeTab: WorkspaceTab;
   onSelectTab: (tab: WorkspaceTab) => void;
   onNewProject: () => void;
-  onOpenSettings: () => void;
+  onOpenSettings: (tab?: SettingsModalTab) => void;
   hasActiveProject: boolean;
   hasRenderedVideo: boolean;
+  hasActiveByokKey: boolean;
 }
 
 export default function TopNav({
@@ -28,6 +30,7 @@ export default function TopNav({
   onOpenSettings,
   hasActiveProject,
   hasRenderedVideo,
+  hasActiveByokKey,
 }: TopNavProps) {
   return (
     <>
@@ -99,10 +102,16 @@ export default function TopNav({
           </button>
           <button
             type="button"
-            onClick={onOpenSettings}
-            className="py-1 transition-colors whitespace-nowrap shrink-0 hover:text-white"
+            onClick={() => onOpenSettings('keys')}
+            className="inline-flex items-center gap-1.5 py-1 transition-colors whitespace-nowrap shrink-0 hover:text-white"
           >
-            Settings
+            {hasActiveByokKey && (
+              <span
+                aria-hidden="true"
+                className="h-1.5 w-1.5 rounded-full bg-emerald-400"
+              />
+            )}
+            <span>API Keys &amp; Settings</span>
           </button>
         </nav>
 
@@ -188,12 +197,14 @@ export default function TopNav({
 
         <button
           type="button"
-          onClick={onOpenSettings}
+          onClick={() => onOpenSettings('keys')}
           className="flex min-h-[44px] flex-col items-center justify-center text-slate-400"
         >
-          <Settings className="h-4 w-4" />
+          <KeyRound
+            className={`h-4 w-4 ${hasActiveByokKey ? 'text-emerald-400' : ''}`}
+          />
           <span className="mt-0.5 text-[10px] font-medium whitespace-nowrap">
-            Settings
+            API Keys
           </span>
         </button>
       </nav>

@@ -5,6 +5,10 @@ import {
   AlertTriangle,
   CheckCircle2,
   Circle,
+  Cloud,
+  Cpu,
+  Download,
+  KeyRound,
   Loader2,
   Play,
   RefreshCw,
@@ -12,6 +16,7 @@ import {
 } from 'lucide-react';
 import {formatTimecode} from '@/lib/format';
 import {
+  CloudJobRecord,
   MediaAssetMeta,
   PipelineProgress,
   PipelineStage,
@@ -22,48 +27,16 @@ interface EditingWorkspaceViewProps {
   project: ProjectRecord;
   progress: PipelineProgress;
   isRunning: boolean;
+  activeCloudJob: CloudJobRecord | null;
   onCancelRender: () => void;
+  onCancelCloudJob: () => Promise<void>;
   onRetryFullPipeline: () => void;
   onRetryRenderOnly: (force720p?: boolean) => void;
+  onRetryCloudJob: () => Promise<void>;
+  onSwitchModeAndRender: (mode: 'local' | 'cloud') => void;
   onGoToPreview: () => void;
+  onOpenApiKeyManager: () => void;
 }
-
-const ORDERED_STAGES: Array<{
-  key: PipelineStage;
-  title: string;
-  desc: string;
-}> = [
-  {
-    key: 'analyzing_media',
-    title: 'Stage A · Media & Waveform Analysis',
-    desc: 'Inspecting resolution, scene changes, keyframe content, voice pauses, and loudness.',
-  },
-  {
-    key: 'transcribing_voice',
-    title: 'Stage B · Voice Transcription & Script Sync',
-    desc: 'Transcribing spoken English / বাংলা words and anchoring timestamps to master voiceover.',
-  },
-  {
-    key: 'generating_edl',
-    title: 'Stage C · AI Editing Decision Engine',
-    desc: 'Matching spoken sentences to visual clips, framing, camera zooms, and pacing.',
-  },
-  {
-    key: 'validating_edl',
-    title: 'Stage D · Timeline & Asset Validation',
-    desc: 'Verifying uploaded asset IDs, source in/out points, and saving EDL to IndexedDB.',
-  },
-  {
-    key: 'mixing_audio',
-    title: 'Stage E & F · Master Audio Ducking & Captions',
-    desc: 'Normalizing voiceover, ducking background music, and shaping Bengali/English subtitles.',
-  },
-  {
-    key: 'rendering_video',
-    title: 'Stage G · FFmpeg.wasm H.264 MP4 Rendering',
-    desc: 'Encoding scenes sequentially in Web Worker and muxing synchronized AAC audio.',
-  },
-];
 
 function getStageOrderIndex(stage: PipelineStage): number {
   switch (stage) {
@@ -77,8 +50,10 @@ function getStageOrderIndex(stage: PipelineStage): number {
       return 3;
     case 'mixing_audio':
     case 'rendering_captions':
+    case 'uploading_cloud':
       return 4;
     case 'rendering_video':
+    case 'queued_cloud':
       return 5;
     case 'completed':
       return 6;
@@ -91,11 +66,63 @@ export default function EditingWorkspaceView({
   project,
   progress,
   isRunning,
+  activeCloudJob,
   onCancelRender,
+  onCancelCloudJob,
   onRetryFullPipeline,
   onRetryRenderOnly,
+  onRetryCloudJob,
+  onSwitchModeAndRender,
   onGoToPreview,
+  onOpenApiKeyManager,
 }: EditingWorkspaceViewProps) {
+  const isCloudMode = project.renderMode === 'cloud';
+
+  const stages = [
+    {
+      key: 'analyzing_media' as PipelineStage,
+      title: 'Stage A · Media & Waveform Analysis',
+      desc: 'Inspecting resolution, scene changes, keyframe content, voice pauses, and loudness.',
+    },
+    {
+      key: 'transcribing_voice' as PipelineStage,
+      title: 'Stage B · Voice Transcription & Script Sync',
+      desc: 'Transcribing spoken English / বাংলা words and anchoring timestamps to master voiceover.',
+    },
+    {
+      key: 'generating_edl' as PipelineStage,
+      title: 'Stage C · AI Editing Decision Engine',
+      desc: 'Matching spoken sentences to visual clips, framing, camera zooms, and pacing.',
+    },
+    {
+      key: 'validating_edl' as PipelineStage,
+      title: 'Stage D · Timeline & Asset Validation',
+      desc: 'Verifying uploaded asset IDs, source in/out points, and saving EDL before rendering.',
+    },
+    isCloudMode
+      ? {
+          key: 'uploading_cloud' as PipelineStage,
+          title: 'Stage E & F · Audio Mix, Captions & Private R2 Upload',
+          desc: 'Uploading mixed master audio, shaped subtitles, and clips via signed R2 URLs.',
+        }
+      : {
+          key: 'mixing_audio' as PipelineStage,
+          title: 'Stage E & F · Master Audio Ducking & Captions',
+          desc: 'Normalizing voiceover, ducking background music, and shaping Bengali/English subtitles.',
+        },
+    isCloudMode
+      ? {
+          key: 'queued_cloud' as PipelineStage,
+          title: 'Stage G · Cloudflare Queues & FFmpeg Worker',
+          desc: 'Persistent background encoding on standalone FFmpeg server (safe to close browser).',
+        }
+      : {
+          key: 'rendering_video' as PipelineStage,
+          title: 'Stage G · FFmpeg.wasm H.264 MP4 Rendering',
+          desc: 'Encoding scenes sequentially in Web Worker and muxing synchronized AAC audio.',
+        },
+  ];
+
   const voiceAsset = project.assets.find((a) => a.role === 'voiceover');
   const voiceAnalysis =
     voiceAsset?.analysis?.kind === 'voice' ? voiceAsset.analysis : null;
@@ -105,6 +132,9 @@ export default function EditingWorkspaceView({
   );
 
   const activeIdx = getStageOrderIndex(progress.stage);
+  const errorText = progress.error || activeCloudJob?.errorDetails || '';
+  const looksLikeKeyError =
+    /api key|quota|rate limit|401|403|429|missing_api_key/i.test(errorText);
 
   return (
     <div className="mx-auto max-w-7xl px-4 py-8 sm:px-6 lg:px-8 space-y-10 pb-28 md:pb-16">
@@ -113,12 +143,23 @@ export default function EditingWorkspaceView({
         <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
           <div className="space-y-1">
             <p className="text-xs font-medium text-blue-400">
-              AI Editing Workspace · {project.edl?.projectTitle || project.name}
+              AI Editing Workspace · {project.edl?.projectTitle || project.name} ·{' '}
+              {isCloudMode
+                ? 'Cloud Background Mode'
+                : 'Local FFmpeg.wasm Mode'}
             </p>
             <h1 className="text-2xl font-bold tracking-tight text-white">
-              {progress.stageLabel || 'Automatic Video Editing Pipeline'}
+              {activeCloudJob?.state === 'COMPLETED'
+                ? 'Cloud MP4 Ready in Private R2'
+                : activeCloudJob?.state === 'RENDERING'
+                  ? 'Standalone FFmpeg Worker Encoding MP4'
+                  : activeCloudJob?.state === 'QUEUED'
+                    ? 'Queued in Cloudflare Queues'
+                    : progress.stageLabel || 'Automatic Video Editing Pipeline'}
             </h1>
-            <p className="text-sm text-slate-400">{progress.detail}</p>
+            <p className="text-sm text-slate-400">
+              {activeCloudJob ? activeCloudJob.progressDetail : progress.detail}
+            </p>
           </div>
 
           <div className="flex flex-wrap items-center gap-3 shrink-0">
@@ -129,27 +170,56 @@ export default function EditingWorkspaceView({
                 className="inline-flex min-h-[42px] items-center gap-2 rounded-xl border border-rose-500/40 bg-rose-950/30 px-4 py-2 text-xs font-semibold text-rose-200 hover:bg-rose-900/50 whitespace-nowrap"
               >
                 <Square className="h-3.5 w-3.5 fill-current" />
-                <span>Cancel Rendering</span>
-              </button>
-            )}
-
-            {!isRunning && progress.stage === 'completed' && (
-              <button
-                type="button"
-                onClick={onGoToPreview}
-                className="inline-flex min-h-[44px] items-center gap-2 rounded-xl bg-blue-600 px-5 py-2.5 text-sm font-semibold text-white hover:bg-blue-500 whitespace-nowrap"
-              >
-                <Play className="h-4 w-4 fill-current" />
-                <span>Open Final Video Preview</span>
+                <span>
+                  {isCloudMode ? 'Cancel Upload & Job' : 'Cancel Rendering'}
+                </span>
               </button>
             )}
 
             {!isRunning &&
+              activeCloudJob &&
+              (activeCloudJob.state === 'QUEUED' ||
+                activeCloudJob.state === 'RENDERING') && (
+                <button
+                  type="button"
+                  onClick={() => void onCancelCloudJob()}
+                  className="inline-flex min-h-[42px] items-center gap-2 rounded-xl border border-rose-500/40 bg-rose-950/30 px-4 py-2 text-xs font-semibold text-rose-200 hover:bg-rose-900/50 whitespace-nowrap"
+                >
+                  <Square className="h-3.5 w-3.5 fill-current" />
+                  <span>Cancel Cloud Job</span>
+                </button>
+              )}
+
+            {!isRunning &&
+              (progress.stage === 'completed' ||
+                activeCloudJob?.state === 'COMPLETED') && (
+                <button
+                  type="button"
+                  onClick={onGoToPreview}
+                  className="inline-flex min-h-[44px] items-center gap-2 rounded-xl bg-blue-600 px-5 py-2.5 text-sm font-semibold text-white hover:bg-blue-500 whitespace-nowrap"
+                >
+                  <Play className="h-4 w-4 fill-current" />
+                  <span>Open Final Video Preview</span>
+                </button>
+              )}
+
+            {!isRunning &&
               (progress.stage === 'error' ||
                 progress.stage === 'cancelled' ||
-                project.status === 'interrupted') && (
+                project.status === 'interrupted' ||
+                activeCloudJob?.state === 'FAILED' ||
+                activeCloudJob?.state === 'CANCELLED') && (
                 <>
-                  {project.edl ? (
+                  {isCloudMode && activeCloudJob?.manifestKey ? (
+                    <button
+                      type="button"
+                      onClick={() => void onRetryCloudJob()}
+                      className="inline-flex min-h-[42px] items-center gap-2 rounded-xl bg-blue-600 px-4 py-2 text-xs font-semibold text-white hover:bg-blue-500 whitespace-nowrap"
+                    >
+                      <RefreshCw className="h-3.5 w-3.5" />
+                      <span>Retry Cloud Queue Job</span>
+                    </button>
+                  ) : project.edl ? (
                     <>
                       <button
                         type="button"
@@ -157,9 +227,14 @@ export default function EditingWorkspaceView({
                         className="inline-flex min-h-[42px] items-center gap-2 rounded-xl bg-blue-600 px-4 py-2 text-xs font-semibold text-white hover:bg-blue-500 whitespace-nowrap"
                       >
                         <RefreshCw className="h-3.5 w-3.5" />
-                        <span>Retry Render ({project.edl.resolution})</span>
+                        <span>
+                          {isCloudMode
+                            ? 'Resume Cloud Upload & Queue'
+                            : `Retry Render (${project.edl.resolution})`}
+                        </span>
                       </button>
-                      {project.edl.resolution === '1080p' && (
+
+                      {!isCloudMode && project.edl.resolution === '1080p' && (
                         <button
                           type="button"
                           onClick={() => onRetryRenderOnly(true)}
@@ -168,6 +243,26 @@ export default function EditingWorkspaceView({
                           <span>Retry in 720p Low-Memory Mode</span>
                         </button>
                       )}
+
+                      <button
+                        type="button"
+                        onClick={() =>
+                          onSwitchModeAndRender(isCloudMode ? 'local' : 'cloud')
+                        }
+                        className="inline-flex min-h-[42px] items-center gap-2 rounded-xl border border-slate-700 px-3.5 py-2 text-xs font-medium text-slate-200 hover:bg-slate-800 whitespace-nowrap"
+                      >
+                        {isCloudMode ? (
+                          <>
+                            <Cpu className="h-3.5 w-3.5 text-blue-400" />
+                            <span>Render Locally Instead</span>
+                          </>
+                        ) : (
+                          <>
+                            <Cloud className="h-3.5 w-3.5 text-blue-400" />
+                            <span>Queue in Cloud Instead</span>
+                          </>
+                        )}
+                      </button>
                     </>
                   ) : (
                     <button
@@ -184,51 +279,140 @@ export default function EditingWorkspaceView({
           </div>
         </div>
 
+        {/* Active Local Browser Warning */}
+        {!isCloudMode &&
+          isRunning &&
+          (progress.stage === 'mixing_audio' ||
+            progress.stage === 'rendering_captions' ||
+            progress.stage === 'rendering_video') && (
+            <div className="rounded-xl border border-amber-500/35 bg-amber-950/20 px-4 py-3 text-xs text-amber-200 flex flex-wrap items-center justify-between gap-2">
+              <span>
+                Local FFmpeg.wasm Rendering Active — Please keep this browser tab open and active until MP4 encoding completes.
+              </span>
+              <span className="font-mono text-amber-300">
+                Zero cloud rendering cost
+              </span>
+            </div>
+          )}
+
+        {/* Cloud Background Job Safe-To-Close Confirmation Card */}
+        {isCloudMode &&
+          activeCloudJob &&
+          (activeCloudJob.state === 'QUEUED' ||
+            activeCloudJob.state === 'RENDERING' ||
+            activeCloudJob.state === 'COMPLETED') && (
+            <div className="rounded-xl border border-emerald-500/35 bg-emerald-950/15 p-4 space-y-2">
+              <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+                <span className="font-semibold text-emerald-300">
+                  {activeCloudJob.state === 'COMPLETED'
+                    ? `Cloud Job Completed (${activeCloudJob.id})`
+                    : `Cloud Job Accepted (${activeCloudJob.id}) · State: ${activeCloudJob.state}`}
+                </span>
+                <span className="font-mono tabular-nums text-slate-300">
+                  Cloudflare D1 + R2 Persisted
+                </span>
+              </div>
+              <p className="text-xs text-slate-300 leading-relaxed">
+                {activeCloudJob.state === 'COMPLETED'
+                  ? 'Your finished H.264 MP4 is stored in private Cloudflare R2. Preview or download it using a short-lived signed URL.'
+                  : 'You can safely close Chrome, leave this website, or turn off your phone right now. Your standalone FFmpeg Worker Server will process the validated EDL and store the completed MP4 in private R2.'}
+              </p>
+              {activeCloudJob.state === 'COMPLETED' &&
+                activeCloudJob.outputVideoSignedUrl && (
+                  <div className="pt-1 flex flex-wrap gap-2.5">
+                    <a
+                      href={activeCloudJob.outputVideoSignedUrl}
+                      download={`${project.name || 'short'}.mp4`}
+                      className="inline-flex min-h-[38px] items-center gap-1.5 rounded-lg bg-emerald-600 px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-emerald-500"
+                    >
+                      <Download className="h-3.5 w-3.5" />
+                      <span>Download Cloud MP4</span>
+                    </a>
+                  </div>
+                )}
+            </div>
+          )}
+
         {/* Progress Bar */}
         <div className="space-y-2">
           <div className="flex items-center justify-between text-xs font-mono tabular-nums text-slate-300">
             <span>
               {progress.sceneTotal
                 ? `Scene ${progress.sceneCurrent ?? 1} of ${progress.sceneTotal}`
-                : progress.stage === 'completed'
-                  ? 'Render verified'
-                  : 'Pipeline progress'}
+                : activeCloudJob
+                  ? `Cloud state: ${activeCloudJob.state}`
+                  : progress.stage === 'completed'
+                    ? 'Render verified'
+                    : 'Pipeline progress'}
             </span>
-            <span>{Math.round(progress.percent)}%</span>
+            <span>
+              {Math.round(
+                activeCloudJob ? activeCloudJob.progressPercent : progress.percent
+              )}
+              %
+            </span>
           </div>
           <div className="h-2.5 w-full overflow-hidden rounded-full bg-slate-800">
             <div
               className="h-full rounded-full bg-blue-500 transition-transform duration-200 origin-left"
               style={{
-                transform: `scaleX(${Math.max(0.02, Math.min(1, progress.percent / 100))})`,
+                transform: `scaleX(${Math.max(
+                  0.02,
+                  Math.min(
+                    1,
+                    (activeCloudJob
+                      ? activeCloudJob.progressPercent
+                      : progress.percent) / 100
+                  )
+                )})`,
               }}
             />
           </div>
         </div>
 
         {/* Error Box */}
-        {progress.error && (
+        {errorText && (
           <div
             role="alert"
-            className="flex items-start gap-3 rounded-xl border border-rose-500/40 bg-rose-950/30 p-4 text-sm text-rose-200"
+            className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between rounded-xl border border-rose-500/40 bg-rose-950/30 p-4 text-sm text-rose-200"
           >
-            <AlertTriangle className="h-5 w-5 text-rose-400 shrink-0 mt-0.5" />
-            <div className="space-y-1">
-              <p className="font-semibold text-rose-100">Pipeline Halted</p>
-              <p className="text-xs leading-relaxed text-rose-200">
-                {progress.error}
-              </p>
+            <div className="flex items-start gap-3">
+              <AlertTriangle className="h-5 w-5 text-rose-400 shrink-0 mt-0.5" />
+              <div className="space-y-1">
+                <p className="font-semibold text-rose-100">Pipeline Halted</p>
+                <p className="text-xs leading-relaxed text-rose-200">
+                  {errorText}
+                </p>
+              </div>
             </div>
+            {looksLikeKeyError && (
+              <button
+                type="button"
+                onClick={onOpenApiKeyManager}
+                className="inline-flex min-h-[38px] items-center gap-1.5 rounded-lg border border-rose-400/40 bg-rose-900/40 px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-rose-800 whitespace-nowrap shrink-0"
+              >
+                <KeyRound className="h-3.5 w-3.5" />
+                <span>Open API Key Manager</span>
+              </button>
+            )}
           </div>
         )}
 
         {/* Stage Checklist */}
         <div className="grid grid-cols-1 gap-3 pt-2 md:grid-cols-2 lg:grid-cols-3">
-          {ORDERED_STAGES.map((st, idx) => {
+          {stages.map((st, idx) => {
+            const cloudCompletedAll = activeCloudJob?.state === 'COMPLETED';
             const isDone =
+              cloudCompletedAll ||
               progress.stage === 'completed' ||
+              (progress.stage === 'queued_cloud' && idx < 5) ||
               (activeIdx > idx && progress.stage !== 'error');
-            const isCurrent = activeIdx === idx && isRunning;
+            const isCurrent =
+              (activeIdx === idx && isRunning) ||
+              (idx === 5 &&
+                activeCloudJob &&
+                (activeCloudJob.state === 'QUEUED' ||
+                  activeCloudJob.state === 'RENDERING'));
 
             return (
               <div
@@ -265,7 +449,6 @@ export default function EditingWorkspaceView({
       {/* Voiceover Waveform & Transcript Synchronization Summary */}
       {(voiceAnalysis || project.transcript) && (
         <section className="grid grid-cols-1 gap-6 lg:grid-cols-12">
-          {/* Voiceover Waveform & Audio Metrics */}
           {voiceAnalysis && (
             <div className="rounded-2xl border border-slate-800/80 bg-[#0B1120] p-6 space-y-4 lg:col-span-5">
               <div>
@@ -280,7 +463,6 @@ export default function EditingWorkspaceView({
                 </p>
               </div>
 
-              {/* Real 120-bar Waveform */}
               <div
                 aria-label="Voiceover amplitude waveform"
                 className="flex h-24 items-end gap-[2px] rounded-xl bg-[#060B16] p-3 border border-slate-800/70"
@@ -314,7 +496,6 @@ export default function EditingWorkspaceView({
             </div>
           )}
 
-          {/* Synchronized Transcript */}
           {project.transcript && (
             <div className="rounded-2xl border border-slate-800/80 bg-[#0B1120] p-6 space-y-4 lg:col-span-7">
               <div className="flex flex-wrap items-baseline justify-between gap-2">

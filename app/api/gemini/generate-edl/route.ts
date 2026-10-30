@@ -59,7 +59,7 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const ai = getServerGeminiClient();
+    const {ai} = getServerGeminiClient(req);
     const directorModel = resolveDirectorModel(rawModel);
     const preset = EDITING_PRESETS[presetId] || EDITING_PRESETS.auto;
     const cappedDuration = Math.min(180, Math.max(1, Number(voiceDuration) || 10));

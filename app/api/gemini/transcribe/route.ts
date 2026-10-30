@@ -30,7 +30,7 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const ai = getServerGeminiClient();
+    const {ai} = getServerGeminiClient(req);
     const directorModel = resolveDirectorModel(rawModel);
 
     // Pass 1: Verbatim speech transcription via gemini-3.5-transcribe

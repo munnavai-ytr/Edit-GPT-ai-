@@ -1,4 +1,5 @@
 import {validateAndRepairEDL} from './edl-validator';
+import {buildGeminiAuthHeaders} from './gemini-client';
 import {
   EditDecisionList,
   EditingPresetId,
@@ -74,9 +75,10 @@ export async function generateProjectEDL(params: {
       };
     });
 
+  const headers = await buildGeminiAuthHeaders();
   const res = await fetch('/api/gemini/generate-edl', {
     method: 'POST',
-    headers: {'Content-Type': 'application/json'},
+    headers,
     body: JSON.stringify({
       voiceDuration,
       pauses,

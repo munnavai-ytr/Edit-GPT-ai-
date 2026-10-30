@@ -9,6 +9,8 @@ export type EditingPresetId =
   | 'minimal_clean'
   | 'gaming';
 
+export type RenderMode = 'local' | 'cloud';
+
 export type MediaAssetRole =
   | 'voiceover'
   | 'video'
@@ -305,6 +307,8 @@ export type PipelineStage =
   | 'transcribing_voice'
   | 'generating_edl'
   | 'validating_edl'
+  | 'uploading_cloud'
+  | 'queued_cloud'
   | 'mixing_audio'
   | 'rendering_captions'
   | 'rendering_video'
@@ -326,6 +330,7 @@ export interface PipelineProgress {
 export type ProjectStatus =
   | 'draft'
   | 'processing'
+  | 'cloud_queued'
   | 'interrupted'
   | 'completed'
   | 'error';
@@ -336,6 +341,8 @@ export interface ProjectRecord {
   createdAt: number;
   updatedAt: number;
   status: ProjectStatus;
+  renderMode?: RenderMode;
+  cloudJobId?: string;
   lastStage?: PipelineStage;
   errorMessage?: string;
   preset: EditingPresetId;
@@ -356,8 +363,119 @@ export interface ProjectRecord {
 }
 
 export interface AppSettings {
-  directorModel: 'gemini-3.8-flash' | 'gemini-3.1-flash-lite';
-  transcriptionModel: 'gemini-3.5-transcribe';
+  directorModel: string;
+  transcriptionModel: string;
   defaultResolution: OutputResolution;
+  defaultRenderMode: RenderMode;
   autoLowMemoryFallback: boolean;
+}
+
+// --- BYOK API KEY VAULT TYPES ---
+export interface StoredApiKeySummary {
+  id: string;
+  label: string;
+  maskedPreview: string;
+  isActive: boolean;
+  createdAt: number;
+  updatedAt: number;
+  lastTestedAt?: number;
+  lastTestStatus?: 'valid' | 'invalid' | 'quota_exceeded' | 'error';
+  lastTestMessage?: string;
+}
+
+// --- CLOUD INFRASTRUCTURE & PERSISTENT JOB TYPES ---
+export type CloudJobState =
+  | 'QUEUED'
+  | 'UPLOADING'
+  | 'ANALYZING'
+  | 'PLANNING'
+  | 'RENDERING'
+  | 'COMPLETED'
+  | 'FAILED'
+  | 'CANCELLED';
+
+export type StepStatus =
+  | 'pending'
+  | 'in_progress'
+  | 'completed'
+  | 'failed'
+  | 'cancelled';
+
+export interface CloudJobRecord {
+  id: string;
+  projectId: string;
+  projectName: string;
+  state: CloudJobState;
+  uploadStatus: StepStatus;
+  analysisStatus: StepStatus;
+  planStatus: StepStatus;
+  renderStatus: StepStatus;
+  completionStatus: 'incomplete' | 'completed' | 'failed' | 'cancelled';
+  progressPercent: number;
+  progressDetail: string;
+  errorDetails: string | null;
+  r2Prefix: string;
+  manifestKey: string | null;
+  outputVideoKey: string | null;
+  outputVideoSignedUrl?: string | null;
+  outputSignedUrlExpiresAt?: number | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface CloudConnectionSettings {
+  cfAccountId: string;
+  cfApiToken: string;
+  cfD1DatabaseId: string;
+  cfQueueId: string;
+  r2AccountId: string;
+  r2AccessKeyId: string;
+  r2SecretAccessKey: string;
+  r2BucketName: string;
+  workerWakeUrl?: string;
+  workerSharedSecret?: string;
+}
+
+export interface CloudManifestSceneOverlay {
+  r2Key: string;
+  x: number;
+  y: number;
+  localStart: number;
+  localEnd: number;
+}
+
+export interface CloudRenderManifest {
+  version: 1;
+  jobId: string;
+  projectId: string;
+  projectName: string;
+  createdAt: number;
+  width: number;
+  height: number;
+  fps: number;
+  totalDuration: number;
+  masterAudioKey: string;
+  watermark?: {
+    r2Key: string;
+    x: number;
+    y: number;
+  } | null;
+  scenes: Array<{
+    sceneIndex: number;
+    assetKind: 'video' | 'image';
+    assetDuration: number;
+    assetExt: string;
+    sourceR2Key: string;
+    sourceInPoint: number;
+    duration: number;
+    cropMode: CropMode;
+    zoomAnimation: ZoomAnimation;
+    fadeIn: boolean;
+    fadeOut: boolean;
+    fadeOutDuration: number;
+    contrast: number;
+    brightness: number;
+    saturation: number;
+    overlays: CloudManifestSceneOverlay[];
+  }>;
 }

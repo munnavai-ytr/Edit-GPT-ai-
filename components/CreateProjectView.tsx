@@ -6,10 +6,13 @@ import {
   Check,
   ChevronDown,
   ChevronUp,
+  Cloud,
+  Cpu,
   FileAudio,
   FileText,
   Film,
   Image as ImageIcon,
+  KeyRound,
   Music,
   Play,
   Sliders,
@@ -18,6 +21,7 @@ import {
   Type as TypeIcon,
   Upload,
 } from 'lucide-react';
+import type {SettingsModalTab} from './SettingsModal';
 import {PRESET_LIST} from '@/lib/presets';
 import {formatBytes} from '@/lib/format';
 import {
@@ -26,6 +30,7 @@ import {
   MediaAssetRole,
   OutputAspectRatio,
   OutputResolution,
+  RenderMode,
 } from '@/lib/types';
 
 interface CreateProjectViewProps {
@@ -40,6 +45,10 @@ interface CreateProjectViewProps {
   onChangeEditingInstructions: (val: string) => void;
   preset: EditingPresetId;
   onChangePreset: (preset: EditingPresetId) => void;
+  renderMode: RenderMode;
+  onChangeRenderMode: (mode: RenderMode) => void;
+  cloudConfigured: boolean;
+  onOpenSettings: (tab?: SettingsModalTab) => void;
   outputResolution: OutputResolution;
   onChangeResolution: (res: OutputResolution) => void;
   aspectRatio: OutputAspectRatio;
@@ -71,6 +80,10 @@ export default function CreateProjectView({
   onChangeEditingInstructions,
   preset,
   onChangePreset,
+  renderMode,
+  onChangeRenderMode,
+  cloudConfigured,
+  onOpenSettings,
   outputResolution,
   onChangeResolution,
   aspectRatio,
@@ -403,12 +416,119 @@ export default function CreateProjectView({
         </div>
       </section>
 
-      {/* SECTION 2: EDITING PRESETS & OUTPUT FORMAT */}
+      {/* SECTION 1B: TWO RENDERING MODES */}
+      <section className="space-y-4">
+        <div className="flex flex-wrap items-baseline justify-between gap-2">
+          <div>
+            <h2 className="text-lg font-semibold text-white">
+              02. Rendering Execution Mode
+            </h2>
+            <p className="text-xs text-slate-400">
+              AI planning always uses your active Gemini API key first. Choose whether FFmpeg video encoding runs in-browser or on your cloud worker.
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={() => onOpenSettings('keys')}
+            className="inline-flex items-center gap-1.5 text-xs font-medium text-blue-400 hover:text-blue-300 underline whitespace-nowrap"
+          >
+            <KeyRound className="h-3.5 w-3.5" />
+            <span>Manage BYOK Gemini API Keys</span>
+          </button>
+        </div>
+
+        <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+          {/* Mode 1: Local Rendering */}
+          <button
+            type="button"
+            onClick={() => onChangeRenderMode('local')}
+            className={`flex flex-col justify-between rounded-2xl border p-5 text-left transition-colors ${
+              renderMode === 'local'
+                ? 'border-blue-500 bg-blue-950/20'
+                : 'border-slate-800/80 bg-[#0B1120] hover:border-slate-700'
+            }`}
+          >
+            <div className="space-y-2">
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <Cpu className="h-4 w-4 text-blue-400 shrink-0" />
+                  <span className="text-sm font-semibold text-white">
+                    Local Browser Rendering (FFmpeg.wasm)
+                  </span>
+                </div>
+                {renderMode === 'local' && (
+                  <Check className="h-4 w-4 text-blue-400 shrink-0" />
+                )}
+              </div>
+              <p className="text-xs leading-relaxed text-slate-300">
+                Encodes H.264 MP4 directly inside your browser Web Worker with zero cloud rendering costs or external servers.
+              </p>
+            </div>
+            <p className="mt-3 pt-2.5 border-t border-slate-800/80 text-[11px] font-mono text-slate-400">
+              Keep browser tab active while rendering · Auto 720p memory recovery
+            </p>
+          </button>
+
+          {/* Mode 2: Cloud Background Rendering */}
+          <div
+            onClick={() => onChangeRenderMode('cloud')}
+            role="button"
+            tabIndex={0}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                onChangeRenderMode('cloud');
+              }
+            }}
+            className={`flex flex-col justify-between rounded-2xl border p-5 text-left transition-colors cursor-pointer ${
+              renderMode === 'cloud'
+                ? 'border-blue-500 bg-blue-950/20'
+                : 'border-slate-800/80 bg-[#0B1120] hover:border-slate-700'
+            }`}
+          >
+            <div className="space-y-2">
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <Cloud className="h-4 w-4 text-blue-400 shrink-0" />
+                  <span className="text-sm font-semibold text-white">
+                    Cloud Background Rendering (R2 + D1 + Queues)
+                  </span>
+                </div>
+                {renderMode === 'cloud' && (
+                  <Check className="h-4 w-4 text-blue-400 shrink-0" />
+                )}
+              </div>
+              <p className="text-xs leading-relaxed text-slate-300">
+                Uploads assets &amp; validated EDL to private Cloudflare R2 and dispatches a persistent job to your standalone FFmpeg Worker Server.
+              </p>
+            </div>
+            <div className="mt-3 pt-2.5 border-t border-slate-800/80 flex flex-wrap items-center justify-between gap-2 text-[11px] font-mono">
+              <span className="text-slate-400">
+                Safe to close Chrome or turn off phone once queued
+              </span>
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onOpenSettings('cloud');
+                }}
+                className={`underline font-sans font-semibold ${
+                  cloudConfigured ? 'text-emerald-400' : 'text-amber-400'
+                }`}
+              >
+                {cloudConfigured ? 'Cloud Ready · Check' : 'Configure Cloud →'}
+              </button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      {/* SECTION 3: EDITING PRESETS & OUTPUT FORMAT */}
       <section className="space-y-4">
         <div className="flex flex-col gap-2 sm:flex-row sm:items-baseline sm:justify-between">
           <div>
             <h2 className="text-lg font-semibold text-white">
-              02. Editing Style Preset &amp; Output Format
+              03. Editing Style Preset &amp; Output Format
             </h2>
             <p className="text-xs text-slate-400">
               Auto Style is selected by default. Presets control cut speed, color grading, zoom cadence, and caption styling.
@@ -500,7 +620,7 @@ export default function CreateProjectView({
         >
           <div>
             <h2 className="text-lg font-semibold text-white">
-              03. Optional Inputs &amp; Creative Enhancements
+              04. Optional Inputs &amp; Creative Enhancements
             </h2>
             <p className="text-xs text-slate-400">
               All fields below are optional—leave any blank to let Gemini handle them automatically.
@@ -872,7 +992,13 @@ export default function CreateProjectView({
           </h2>
           <p className="text-xs text-slate-400">
             {readyToCreate
-              ? `Voiceover + ${totalVisualCount} visual ${totalVisualCount === 1 ? 'asset' : 'assets'} ready · Output: ${aspectRatio} ${outputResolution} MP4 (max 180s)`
+              ? `Voiceover + ${totalVisualCount} visual ${
+                  totalVisualCount === 1 ? 'asset' : 'assets'
+                } ready · Mode: ${
+                  renderMode === 'cloud'
+                    ? 'Cloud Background Queue (R2 + Worker)'
+                    : 'Local FFmpeg.wasm'
+                } · Output: ${aspectRatio} ${outputResolution}`
               : 'Upload 1 mandatory voiceover and at least 1 video clip or image above to enable creation.'}
           </p>
         </div>
@@ -888,7 +1014,11 @@ export default function CreateProjectView({
           }`}
         >
           <Play className="h-4 w-4 fill-current" />
-          <span>CREATE MY VIDEO</span>
+          <span>
+            {renderMode === 'cloud'
+              ? 'CREATE & QUEUE IN CLOUD'
+              : 'CREATE MY VIDEO'}
+          </span>
         </button>
       </section>
     </div>

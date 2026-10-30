@@ -1,22 +1,42 @@
 'use client';
 
-import React, {useCallback, useEffect, useRef, useState} from 'react';
+import React, {useCallback, useEffect, useMemo, useRef, useState} from 'react';
 import {AnimatePresence, motion} from 'motion/react';
 import TopNav, {WorkspaceTab} from './TopNav';
 import DashboardView from './DashboardView';
 import CreateProjectView from './CreateProjectView';
 import EditingWorkspaceView from './EditingWorkspaceView';
 import FinalPreviewView from './FinalPreviewView';
-import SettingsModal from './SettingsModal';
-import {analyzeAllProjectAssets, analyzeAuxAudioFile, analyzeImageFile} from '@/lib/media-analysis';
+import SettingsModal, {SettingsModalTab} from './SettingsModal';
+import {
+  analyzeAllProjectAssets,
+  analyzeAuxAudioFile,
+  analyzeImageFile,
+} from '@/lib/media-analysis';
 import {transcribeAndSyncVoiceover} from '@/lib/transcription';
 import {generateProjectEDL} from '@/lib/edit-decision-engine';
-import {FFmpegRenderController, RenderCancelledError} from '@/lib/ffmpeg-engine';
+import {
+  FFmpegRenderController,
+  RenderCancelledError,
+} from '@/lib/ffmpeg-engine';
+import {
+  cancelCloudJob,
+  checkCloudInfrastructureStatus,
+  CloudUploadCancelledError,
+  createAnalyzingCloudJob,
+  deleteCloudJobAndAssets,
+  fetchCloudJobDetail,
+  fetchCloudJobs,
+  retryCloudJob,
+  updateCloudJobStage,
+  uploadAndEnqueueCloudRenderJob,
+} from '@/lib/cloud-client';
+import {listStoredApiKeys} from '@/lib/crypto-vault';
 import {
   clearAllStorage,
-   DEFAULT_APP_SETTINGS,
   deleteProject,
   detectDeviceMemoryGB,
+  getProject,
   getProjectMediaBlobs,
   getRenderedVideo,
   getStorageSummary,
@@ -29,6 +49,7 @@ import {
 } from '@/lib/storage';
 import {
   AppSettings,
+  CloudJobRecord,
   EditDecisionList,
   EditingPresetId,
   MediaAssetMeta,
@@ -37,9 +58,13 @@ import {
   OutputResolution,
   PipelineProgress,
   ProjectRecord,
+  RenderMode,
 } from '@/lib/types';
 
-function createFreshDraftProject(defaultRes: OutputResolution): ProjectRecord {
+function createFreshDraftProject(
+  defaultRes: OutputResolution,
+  defaultMode: RenderMode
+): ProjectRecord {
   const now = Date.now();
   const id = `proj_${now}_${Math.random().toString(36).slice(2, 8)}`;
   return {
@@ -48,6 +73,7 @@ function createFreshDraftProject(defaultRes: OutputResolution): ProjectRecord {
     createdAt: now,
     updatedAt: now,
     status: 'draft',
+    renderMode: defaultMode,
     preset: 'auto',
     scriptText: '',
     editingInstructions: '',
@@ -65,7 +91,10 @@ const SINGLETON_ROLES = new Set<MediaAssetRole>([
   'custom_font',
 ]);
 
-function validateFileFormatForRole(role: MediaAssetRole, file: File): string | null {
+function validateFileFormatForRole(
+  role: MediaAssetRole,
+  file: File
+): string | null {
   const ext = (file.name.split('.').pop() || '').toLowerCase();
   if (role === 'voiceover') {
     if (!['mp3', 'wav', 'm4a', 'aac'].includes(ext)) {
@@ -108,15 +137,29 @@ export default function EditorApp() {
     quotaBytes?: number;
   }>({projectCount: 0, totalBytes: 0});
 
-  const [settings, setSettings] = useState<AppSettings>(() => loadAppSettings());
+  const [settings, setSettings] = useState<AppSettings>(() =>
+    loadAppSettings()
+  );
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [deviceMemoryGB] = useState<number | null>(() => detectDeviceMemoryGB());
+  const [settingsTab, setSettingsTab] = useState<SettingsModalTab>('keys');
+  const [hasActiveByokKey, setHasActiveByokKey] = useState(false);
+
+  const [cloudConfigured, setCloudConfigured] = useState(false);
+  const [cloudJobs, setCloudJobs] = useState<CloudJobRecord[]>([]);
+  const [cloudJobsLoading, setCloudJobsLoading] = useState(false);
+  const [previewCloudJob, setPreviewCloudJob] =
+    useState<CloudJobRecord | null>(null);
+
+  const [deviceMemoryGB] = useState<number | null>(() =>
+    detectDeviceMemoryGB()
+  );
 
   const [currentProject, setCurrentProject] = useState<ProjectRecord>(() => {
     const initialSettings = loadAppSettings();
     const mem = detectDeviceMemoryGB();
     return createFreshDraftProject(
-      mem && mem <= 4 ? '720p' : initialSettings.defaultResolution
+      mem && mem <= 4 ? '720p' : initialSettings.defaultResolution,
+      initialSettings.defaultRenderMode
     );
   });
   const [currentBlobs, setCurrentBlobs] = useState<Map<string, Blob>>(
@@ -134,7 +177,13 @@ export default function EditorApp() {
   });
 
   const renderControllerRef = useRef<FFmpegRenderController | null>(null);
+  const cloudAbortRef = useRef<AbortController | null>(null);
   const videoUrlRef = useRef<string | null>(null);
+
+  const openSettingsModal = useCallback((tab: SettingsModalTab = 'keys') => {
+    setSettingsTab(tab);
+    setSettingsOpen(true);
+  }, []);
 
   const setManagedVideoUrl = useCallback((blob: Blob | null) => {
     if (videoUrlRef.current) {
@@ -150,10 +199,62 @@ export default function EditorApp() {
     }
   }, []);
 
+  const refreshByokIndicator = useCallback(async () => {
+    try {
+      const keys = await listStoredApiKeys();
+      setHasActiveByokKey(keys.length > 0);
+    } catch {
+      setHasActiveByokKey(false);
+    }
+  }, []);
+
+  const refreshCloudJobs = useCallback(async () => {
+    setCloudJobsLoading(true);
+    try {
+      const res = await fetchCloudJobs();
+      setCloudConfigured(res.configured);
+      setCloudJobs(res.jobs);
+
+      // Sync any completed/failed cloud job status back into local IndexedDB project records
+      if (res.jobs.length > 0) {
+        const localAll = await listProjects();
+        let didSyncLocal = false;
+        for (const p of localAll) {
+          if (!p.cloudJobId) continue;
+          const matchingJob = res.jobs.find((j) => j.id === p.cloudJobId);
+          if (!matchingJob) continue;
+          if (matchingJob.state === 'COMPLETED' && p.status !== 'completed') {
+            await saveProject({
+              ...p,
+              status: 'completed',
+              errorMessage: undefined,
+            });
+            didSyncLocal = true;
+          } else if (matchingJob.state === 'FAILED' && p.status === 'cloud_queued') {
+            await saveProject({
+              ...p,
+              status: 'error',
+              errorMessage:
+                matchingJob.errorDetails || 'Cloud background render failed.',
+            });
+            didSyncLocal = true;
+          }
+        }
+        if (didSyncLocal) {
+          const updatedLocal = await listProjects();
+          setProjects(updatedLocal);
+        }
+      }
+    } catch {
+      // Cloud jobs endpoint unreachable or unconfigured
+    } finally {
+      setCloudJobsLoading(false);
+    }
+  }, []);
+
   const refreshDashboardData = useCallback(async () => {
     try {
       const loadedProjects = await listProjects();
-      // Recover any project left in 'processing' state from an earlier browser session
       const normalized: ProjectRecord[] = [];
       for (const p of loadedProjects) {
         if (p.status === 'processing') {
@@ -161,7 +262,7 @@ export default function EditorApp() {
             ...p,
             status: 'interrupted',
             errorMessage:
-              'Previous session ended before rendering finished. You can resume rendering directly.',
+              'Previous browser session ended before completion. You can resume directly.',
           };
           await saveProject(recovered);
           normalized.push(recovered);
@@ -186,17 +287,49 @@ export default function EditorApp() {
     Promise.resolve().then(() => {
       if (active) {
         void refreshDashboardData();
+        void refreshByokIndicator();
+        void refreshCloudJobs();
       }
     });
 
     return () => {
       active = false;
       renderControllerRef.current?.dispose();
+      cloudAbortRef.current?.abort();
       if (videoUrlRef.current) {
         URL.revokeObjectURL(videoUrlRef.current);
       }
     };
-  }, [refreshDashboardData]);
+  }, [refreshDashboardData, refreshByokIndicator, refreshCloudJobs]);
+
+  // Poll Cloudflare D1 every 6 seconds ONLY when real cloud jobs are active in flight
+  const hasInFlightCloudJob = useMemo(
+    () =>
+      cloudJobs.some(
+        (j) =>
+          j.state === 'QUEUED' ||
+          j.state === 'RENDERING' ||
+          j.state === 'UPLOADING' ||
+          j.state === 'ANALYZING' ||
+          j.state === 'PLANNING'
+      ),
+    [cloudJobs]
+  );
+
+  useEffect(() => {
+    if (!cloudConfigured || !hasInFlightCloudJob) return;
+    const timer = window.setInterval(() => {
+      void refreshCloudJobs();
+    }, 6000);
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [cloudConfigured, hasInFlightCloudJob, refreshCloudJobs]);
+
+  const activeWorkspaceCloudJob = useMemo(() => {
+    if (!currentProject.cloudJobId) return null;
+    return cloudJobs.find((j) => j.id === currentProject.cloudJobId) || null;
+  }, [cloudJobs, currentProject.cloudJobId]);
 
   const handleSaveSettings = (next: AppSettings) => {
     setSettings(next);
@@ -206,12 +339,15 @@ export default function EditorApp() {
   const handleStartNewProject = () => {
     if (isPipelineRunning) return;
     setManagedVideoUrl(null);
+    setPreviewCloudJob(null);
     setUploadError(null);
     const defaultRes =
       deviceMemoryGB && deviceMemoryGB <= 4
         ? '720p'
         : settings.defaultResolution;
-    setCurrentProject(createFreshDraftProject(defaultRes));
+    setCurrentProject(
+      createFreshDraftProject(defaultRes, settings.defaultRenderMode)
+    );
     setCurrentBlobs(new Map());
     setProgress({
       stage: 'idle',
@@ -225,12 +361,34 @@ export default function EditorApp() {
   const handleOpenProject = async (project: ProjectRecord) => {
     if (isPipelineRunning) return;
     setUploadError(null);
+    setPreviewCloudJob(null);
     const blobs = await getProjectMediaBlobs(project.id);
     const renderedBlob = await getRenderedVideo(project.id);
 
     setCurrentProject(project);
     setCurrentBlobs(blobs);
     setManagedVideoUrl(renderedBlob ?? null);
+
+    if (project.cloudJobId) {
+      const matching = cloudJobs.find((j) => j.id === project.cloudJobId);
+      if (matching?.state === 'COMPLETED' && matching.outputVideoSignedUrl) {
+        setPreviewCloudJob(matching);
+        setActiveTab('preview');
+        return;
+      }
+      if (project.status === 'cloud_queued') {
+        setProgress({
+          stage: 'queued_cloud',
+          stageLabel: 'Cloud Background Job Active',
+          detail:
+            matching?.progressDetail ||
+            'Persisted in Cloudflare D1 & Queues. Safe to close browser.',
+          percent: matching?.progressPercent ?? 60,
+        });
+        setActiveTab('workspace');
+        return;
+      }
+    }
 
     if (project.status === 'completed' && renderedBlob && project.edl) {
       setProgress({
@@ -240,7 +398,11 @@ export default function EditorApp() {
         percent: 100,
       });
       setActiveTab('preview');
-    } else if (project.edl || project.status === 'interrupted' || project.status === 'error') {
+    } else if (
+      project.edl ||
+      project.status === 'interrupted' ||
+      project.status === 'error'
+    ) {
       setProgress({
         stage: project.status === 'error' ? 'error' : 'validating_edl',
         stageLabel:
@@ -260,19 +422,38 @@ export default function EditorApp() {
   };
 
   const handleDeleteProject = async (projectId: string) => {
+    const target = projects.find((p) => p.id === projectId);
+    if (target?.cloudJobId && cloudConfigured) {
+      await deleteCloudJobAndAssets(target.cloudJobId, false).catch(() => {});
+    }
     await deleteProject(projectId);
     if (currentProject.id === projectId) {
       setManagedVideoUrl(null);
-      setCurrentProject(createFreshDraftProject(settings.defaultResolution));
+      setPreviewCloudJob(null);
+      setCurrentProject(
+        createFreshDraftProject(
+          settings.defaultResolution,
+          settings.defaultRenderMode
+        )
+      );
       setCurrentBlobs(new Map());
     }
     await refreshDashboardData();
+    if (cloudConfigured) {
+      await refreshCloudJobs();
+    }
   };
 
   const handleClearAllStorage = async () => {
     await clearAllStorage();
     setManagedVideoUrl(null);
-    setCurrentProject(createFreshDraftProject(settings.defaultResolution));
+    setPreviewCloudJob(null);
+    setCurrentProject(
+      createFreshDraftProject(
+        settings.defaultResolution,
+        settings.defaultRenderMode
+      )
+    );
     setCurrentBlobs(new Map());
     await refreshDashboardData();
     setActiveTab('dashboard');
@@ -326,7 +507,8 @@ export default function EditorApp() {
 
       if (
         role === 'voiceover' &&
-        (derivedProjectName === 'Untitled Vertical Short' || !derivedProjectName.trim())
+        (derivedProjectName === 'Untitled Vertical Short' ||
+          !derivedProjectName.trim())
       ) {
         derivedProjectName = file.name.replace(/\.[^.]+$/, '');
       }
@@ -359,7 +541,6 @@ export default function EditorApp() {
     await refreshDashboardData();
   };
 
-  // Helper used by FinalPreviewView to upload/replace music or watermark
   const handleUploadAuxFileInPreview = async (
     role: MediaAssetRole,
     file: File
@@ -405,6 +586,7 @@ export default function EditorApp() {
     return assetId;
   };
 
+  // --- LOCAL BROWSER FFMPEG.WASM RENDER EXECUTION ---
   const executeFFmpegRenderPhase = async (
     projToRender: ProjectRecord,
     blobsMap: Map<string, Blob>,
@@ -451,7 +633,6 @@ export default function EditorApp() {
       if (err instanceof RenderCancelledError) {
         throw err;
       }
-      // Automatic low-memory 720p fallback if 1080p failed due to WASM heap limits
       const msg = err instanceof Error ? err.message.toLowerCase() : '';
       const looksLikeMemoryError =
         msg.includes('memory') ||
@@ -478,7 +659,8 @@ export default function EditorApp() {
         setProgress({
           stage: 'rendering_video',
           stageLabel: 'Recovering in 720p Mobile-Safe Mode',
-          detail: '1080p exceeded browser memory limit; re-encoding cleanly at 720p...',
+          detail:
+            '1080p exceeded browser memory limit; re-encoding cleanly at 720p...',
           percent: 58,
         });
         renderResult = await fallbackController.renderProjectVideo({
@@ -503,10 +685,12 @@ export default function EditorApp() {
 
     await saveRenderedVideo(projToRender.id, renderResult.mp4Blob);
     setManagedVideoUrl(renderResult.mp4Blob);
+    setPreviewCloudJob(null);
 
     const completedProj: ProjectRecord = {
       ...projToRender,
       name: activeEdl.projectTitle || projToRender.name,
+      renderMode: 'local',
       status: 'completed',
       lastStage: 'completed',
       errorMessage: undefined,
@@ -530,17 +714,71 @@ export default function EditorApp() {
     setProgress({
       stage: 'completed',
       stageLabel: 'MP4 Video Ready',
-      detail: `Successfully rendered ${renderResult.width}×${renderResult.height} H.264 + AAC MP4.`,
+      detail: `Successfully rendered ${renderResult.width}×${renderResult.height} H.264 + AAC MP4 locally.`,
       percent: 100,
     });
     setActiveTab('preview');
   };
 
-  // ONE-CLICK FULL PIPELINE: Analyze -> Transcribe -> Plan EDL -> Validate -> Render MP4
+  // --- CLOUD BACKGROUND RENDER SUBMISSION (R2 + D1 + QUEUES) ---
+  const executeCloudRenderSubmission = async (
+    projToUpload: ProjectRecord,
+    blobsMap: Map<string, Blob>,
+    edlToUpload: EditDecisionList,
+    existingJobId?: string
+  ) => {
+    const abortCtrl = new AbortController();
+    cloudAbortRef.current = abortCtrl;
+
+    try {
+      const queuedJob = await uploadAndEnqueueCloudRenderJob({
+        existingJobId,
+        project: projToUpload,
+        edl: edlToUpload,
+        assets: projToUpload.assets,
+        blobs: blobsMap,
+        signal: abortCtrl.signal,
+        onProgress: (info) => {
+          setProgress({
+            stage: info.stage,
+            stageLabel:
+              info.stage === 'queued_cloud'
+                ? 'Queued in Cloudflare Queues'
+                : 'Uploading Assets & Captions to Private R2',
+            detail: info.detail,
+            percent: info.percent,
+          });
+        },
+      });
+
+      const queuedProj: ProjectRecord = {
+        ...projToUpload,
+        name: edlToUpload.projectTitle || projToUpload.name,
+        renderMode: 'cloud',
+        cloudJobId: queuedJob.id,
+        status: 'cloud_queued',
+        lastStage: 'queued_cloud',
+        errorMessage: undefined,
+        edl: edlToUpload,
+        updatedAt: Date.now(),
+      };
+
+      setCurrentProject(queuedProj);
+      await saveProject(queuedProj);
+      await refreshDashboardData();
+      await refreshCloudJobs();
+    } finally {
+      cloudAbortRef.current = null;
+    }
+  };
+
+  // --- ONE-CLICK FULL PIPELINE (LOCAL OR CLOUD) ---
   const handleStartOneClickCreate = async () => {
     if (isPipelineRunning) return;
 
-    const voiceAsset = currentProject.assets.find((a) => a.role === 'voiceover');
+    const voiceAsset = currentProject.assets.find(
+      (a) => a.role === 'voiceover'
+    );
     const visualCount = currentProject.assets.filter(
       (a) =>
         a.role === 'video' ||
@@ -556,12 +794,38 @@ export default function EditorApp() {
       return;
     }
 
+    const chosenMode: RenderMode =
+      currentProject.renderMode || settings.defaultRenderMode || 'local';
+
+    // Pre-flight check for Cloud Background Rendering so we never fake or half-run without R2/D1/Queues
+    if (chosenMode === 'cloud') {
+      const infra = await checkCloudInfrastructureStatus();
+      if (!infra.ready) {
+        setUploadError(
+          infra.configured
+            ? `Cloud Background Rendering check failed: ${
+                !infra.r2.ok
+                  ? infra.r2.message
+                  : !infra.d1.ok
+                    ? infra.d1.message
+                    : infra.queue.message
+              }`
+            : 'Cloud Background Rendering is not configured yet. Configure Cloudflare R2, D1, and Queues in Settings → Cloud Render, or select Local Browser Rendering (FFmpeg.wasm).'
+        );
+        return;
+      }
+    }
+
     setIsPipelineRunning(true);
     setActiveTab('workspace');
     setManagedVideoUrl(null);
+    setPreviewCloudJob(null);
+
+    let createdCloudJobId: string | undefined;
 
     let workingProject: ProjectRecord = {
       ...currentProject,
+      renderMode: chosenMode,
       status: 'processing',
       errorMessage: undefined,
       updatedAt: Date.now(),
@@ -575,11 +839,27 @@ export default function EditorApp() {
         setCurrentBlobs(blobsMap);
       }
 
+      if (chosenMode === 'cloud') {
+        const jobRow = await createAnalyzingCloudJob({
+          projectId: workingProject.id,
+          projectName: workingProject.name,
+        });
+        createdCloudJobId = jobRow.id;
+        workingProject = {
+          ...workingProject,
+          cloudJobId: createdCloudJobId,
+        };
+        setCurrentProject(workingProject);
+        await saveProject(workingProject);
+        await refreshCloudJobs();
+      }
+
       // STAGE A: Media Analysis
       setProgress({
         stage: 'analyzing_media',
         stageLabel: 'Stage A · Analyzing Media & Voiceover',
-        detail: 'Extracting video resolutions, scene changes, keyframes, and voice pauses...',
+        detail:
+          'Extracting video resolutions, scene changes, keyframes, and voice pauses...',
         percent: 5,
       });
 
@@ -643,7 +923,17 @@ export default function EditorApp() {
       setCurrentProject(workingProject);
       await saveProject(workingProject);
 
-      // STAGE C & D: AI Edit Decision Engine & EDL Validation
+      if (createdCloudJobId) {
+        await updateCloudJobStage(createdCloudJobId, {
+          state: 'PLANNING',
+          analysisStatus: 'completed',
+          planStatus: 'in_progress',
+          progressPercent: 38,
+          progressDetail: 'Generating validated AI Edit Decision List...',
+        }).catch(() => {});
+      }
+
+      // STAGE C & D: AI Edit Decision Engine & EDL Validation (ALWAYS before rendering!)
       setProgress({
         stage: 'generating_edl',
         stageLabel: 'Stage C · Generating AI Edit Decision List',
@@ -666,12 +956,11 @@ export default function EditorApp() {
         directorModel: settings.directorModel,
       });
 
-      // Save validated EDL to IndexedDB BEFORE FFmpeg rendering for crash recovery
       setProgress({
         stage: 'validating_edl',
         stageLabel: 'Stage D · Timeline Validated & Saved',
-        detail: `Verified ${edl.scenes.length} scenes and ${edl.captions.length} caption cues. Starting FFmpeg.wasm...`,
-        percent: 54,
+        detail: `Verified ${edl.scenes.length} scenes and ${edl.captions.length} caption cues.`,
+        percent: 52,
       });
 
       workingProject = {
@@ -686,14 +975,30 @@ export default function EditorApp() {
       await saveProject(workingProject);
       await refreshDashboardData();
 
-      // STAGE E, F & G: Audio Mixing, Captions & FFmpeg.wasm Rendering
-      await executeFFmpegRenderPhase(workingProject, blobsMap, edl);
+      // Branch by Rendering Execution Mode
+      if (chosenMode === 'cloud') {
+        await executeCloudRenderSubmission(
+          workingProject,
+          blobsMap,
+          edl,
+          createdCloudJobId
+        );
+      } else {
+        await executeFFmpegRenderPhase(workingProject, blobsMap, edl);
+      }
     } catch (err) {
-      if (err instanceof RenderCancelledError) {
+      if (
+        err instanceof RenderCancelledError ||
+        err instanceof CloudUploadCancelledError
+      ) {
+        if (createdCloudJobId) {
+          await cancelCloudJob(createdCloudJobId).catch(() => {});
+          await refreshCloudJobs();
+        }
         const interruptedProj: ProjectRecord = {
           ...workingProject,
           status: 'interrupted',
-          errorMessage: 'Rendering cancelled by user. Saved EDL is ready to resume.',
+          errorMessage: 'Cancelled by user. Saved project is ready to resume.',
           updatedAt: Date.now(),
         };
         setCurrentProject(interruptedProj);
@@ -702,12 +1007,23 @@ export default function EditorApp() {
         setProgress((prev) => ({
           ...prev,
           stage: 'cancelled',
-          stageLabel: 'Rendering Cancelled',
-          detail: 'FFmpeg Web Worker stopped cleanly. Click Retry Render whenever you are ready.',
+          stageLabel: 'Cancelled',
+          detail: 'Stopped cleanly. You can resume whenever ready.',
         }));
       } else {
         const message =
-          err instanceof Error ? err.message : 'Unexpected editing pipeline error.';
+          err instanceof Error
+            ? err.message
+            : 'Unexpected editing pipeline error.';
+        if (createdCloudJobId) {
+          await updateCloudJobStage(createdCloudJobId, {
+            state: 'FAILED',
+            completionStatus: 'failed',
+            errorDetails: message,
+            progressDetail: 'Pipeline halted before queueing.',
+          }).catch(() => {});
+          await refreshCloudJobs();
+        }
         const erroredProj: ProjectRecord = {
           ...workingProject,
           status: 'error',
@@ -732,16 +1048,45 @@ export default function EditorApp() {
 
   const handleCancelRender = () => {
     renderControllerRef.current?.cancel();
+    cloudAbortRef.current?.abort();
   };
 
-  // Re-render video directly from an existing/edited EDL without re-transcribing
+  // Re-render video directly from an existing/edited EDL in Local or Cloud mode
   const handleRerenderFromEDL = async (
     overrideEdl?: EditDecisionList,
-    force720p?: boolean
+    force720p?: boolean,
+    modeOverride?: RenderMode,
+    projectOverride?: ProjectRecord
   ) => {
     if (isPipelineRunning) return;
-    const baseEdl = overrideEdl || currentProject.edl;
+    const baseProject = projectOverride || currentProject;
+    const baseEdl = overrideEdl || baseProject.edl;
     if (!baseEdl) return;
+
+    const targetMode: RenderMode =
+      modeOverride || baseProject.renderMode || settings.defaultRenderMode;
+
+    if (targetMode === 'cloud') {
+      const infra = await checkCloudInfrastructureStatus();
+      if (!infra.ready) {
+        setProgress({
+          stage: 'error',
+          stageLabel: 'Cloud Render Not Configured',
+          detail:
+            'Configure Cloudflare R2, D1, and Queues in Settings → Cloud Render, or click Render Locally Instead.',
+          percent: 50,
+          error: !infra.configured
+            ? 'Missing Cloudflare R2, D1, or Queue configuration.'
+            : !infra.r2.ok
+              ? infra.r2.message
+              : !infra.d1.ok
+                ? infra.d1.message
+                : infra.queue.message,
+        });
+        setActiveTab('workspace');
+        return;
+      }
+    }
 
     const targetEdl: EditDecisionList = force720p
       ? {...baseEdl, resolution: '720p'}
@@ -751,7 +1096,8 @@ export default function EditorApp() {
     setActiveTab('workspace');
 
     const workingProject: ProjectRecord = {
-      ...currentProject,
+      ...baseProject,
+      renderMode: targetMode,
       status: 'processing',
       outputResolution: targetEdl.resolution,
       aspectRatio: targetEdl.aspectRatio,
@@ -763,29 +1109,35 @@ export default function EditorApp() {
     await saveProject(workingProject);
 
     try {
-      let blobsMap = currentBlobs;
-      if (blobsMap.size < workingProject.assets.length) {
-        blobsMap = await getProjectMediaBlobs(workingProject.id);
-        setCurrentBlobs(blobsMap);
+      const blobsMap = await getProjectMediaBlobs(workingProject.id);
+      setCurrentBlobs(blobsMap);
+
+      if (targetMode === 'cloud') {
+        await executeCloudRenderSubmission(workingProject, blobsMap, targetEdl);
+      } else {
+        await executeFFmpegRenderPhase(workingProject, blobsMap, targetEdl);
       }
-      await executeFFmpegRenderPhase(workingProject, blobsMap, targetEdl);
     } catch (err) {
-      if (err instanceof RenderCancelledError) {
+      if (
+        err instanceof RenderCancelledError ||
+        err instanceof CloudUploadCancelledError
+      ) {
         const interrupted: ProjectRecord = {
           ...workingProject,
           status: 'interrupted',
-          errorMessage: 'Rendering cancelled.',
+          errorMessage: 'Cancelled.',
         };
         setCurrentProject(interrupted);
         await saveProject(interrupted);
         setProgress((prev) => ({
           ...prev,
           stage: 'cancelled',
-          stageLabel: 'Rendering Cancelled',
+          stageLabel: 'Cancelled',
           detail: 'You can resume rendering at any time.',
         }));
       } else {
-        const msg = err instanceof Error ? err.message : 'Video rendering failed.';
+        const msg =
+          err instanceof Error ? err.message : 'Video rendering failed.';
         const errored: ProjectRecord = {
           ...workingProject,
           status: 'error',
@@ -797,7 +1149,10 @@ export default function EditorApp() {
           ...prev,
           stage: 'error',
           stageLabel: 'Rendering Failed',
-          detail: 'Try switching to 720p Low-Memory Mode if your browser ran out of memory.',
+          detail:
+            targetMode === 'local'
+              ? 'Try 720p Low-Memory Mode if browser RAM was exceeded.'
+              : 'Verify private R2 CORS and Cloudflare credentials.',
           error: msg,
         }));
       }
@@ -807,10 +1162,11 @@ export default function EditorApp() {
     }
   };
 
-  // Regenerate AI Editing Plan using already-analyzed assets & transcript, then render
   const handleRegeneratePlan = async (presetOverride?: EditingPresetId) => {
     if (isPipelineRunning) return;
-    const voiceAsset = currentProject.assets.find((a) => a.role === 'voiceover');
+    const voiceAsset = currentProject.assets.find(
+      (a) => a.role === 'voiceover'
+    );
     if (
       !currentProject.transcript ||
       !voiceAsset ||
@@ -821,6 +1177,7 @@ export default function EditorApp() {
     }
 
     const chosenPreset = presetOverride || currentProject.preset;
+    const chosenMode = currentProject.renderMode || settings.defaultRenderMode;
     setIsPipelineRunning(true);
     setActiveTab('workspace');
 
@@ -835,16 +1192,14 @@ export default function EditorApp() {
     await saveProject(workingProject);
 
     try {
-      let blobsMap = currentBlobs;
-      if (blobsMap.size < workingProject.assets.length) {
-        blobsMap = await getProjectMediaBlobs(workingProject.id);
-        setCurrentBlobs(blobsMap);
-      }
+      const blobsMap = await getProjectMediaBlobs(workingProject.id);
+      setCurrentBlobs(blobsMap);
 
       setProgress({
         stage: 'generating_edl',
         stageLabel: 'Regenerating AI Edit Decision List',
-        detail: 'Building fresh scene cuts, camera motion, and framing with Gemini...',
+        detail:
+          'Building fresh scene cuts, camera motion, and framing with Gemini...',
         percent: 40,
       });
 
@@ -871,10 +1226,16 @@ export default function EditorApp() {
       setCurrentProject(workingProject);
       await saveProject(workingProject);
 
-      await executeFFmpegRenderPhase(workingProject, blobsMap, edl);
+      if (chosenMode === 'cloud') {
+        await executeCloudRenderSubmission(workingProject, blobsMap, edl);
+      } else {
+        await executeFFmpegRenderPhase(workingProject, blobsMap, edl);
+      }
     } catch (err) {
       const msg =
-        err instanceof Error ? err.message : 'Failed to regenerate editing plan.';
+        err instanceof Error
+          ? err.message
+          : 'Failed to regenerate editing plan.';
       const errored: ProjectRecord = {
         ...workingProject,
         status: 'error',
@@ -895,9 +1256,87 @@ export default function EditorApp() {
     }
   };
 
+  // --- CLOUD DASHBOARD JOB MANAGEMENT HANDLERS ---
+  const handlePreviewCloudJob = async (job: CloudJobRecord) => {
+    const freshJob = await fetchCloudJobDetail(job.id);
+    setPreviewCloudJob(freshJob);
+
+    const localMatch = await getProject(job.projectId);
+    if (localMatch) {
+      const blobs = await getProjectMediaBlobs(localMatch.id);
+      setCurrentProject(localMatch);
+      setCurrentBlobs(blobs);
+    }
+    setActiveTab('preview');
+  };
+
+  const handleRefreshPreviewSignedUrl = async () => {
+    const targetId = previewCloudJob?.id || currentProject.cloudJobId;
+    if (!targetId) return;
+    const freshJob = await fetchCloudJobDetail(targetId);
+    setPreviewCloudJob(freshJob);
+    await refreshCloudJobs();
+  };
+
+  const handleRetryCloudJob = async (job: CloudJobRecord) => {
+    const res = await retryCloudJob(job.id);
+    await refreshCloudJobs();
+
+    if (res.action === 'resume_from_client') {
+      await handleResumeInterruptedUpload(job.projectId);
+    }
+  };
+
+  const handleCancelCloudJob = async (job: CloudJobRecord) => {
+    await cancelCloudJob(job.id);
+    await refreshCloudJobs();
+  };
+
+  const handleResumeInterruptedUpload = async (projectId: string) => {
+    const saved = await getProject(projectId);
+    if (!saved) {
+      throw new Error(
+        'Original local media project is no longer stored on this browser.'
+      );
+    }
+    const blobs = await getProjectMediaBlobs(saved.id);
+    setCurrentProject({...saved, renderMode: 'cloud'});
+    setCurrentBlobs(blobs);
+
+    if (saved.edl) {
+      await handleRerenderFromEDL(saved.edl, false, 'cloud', {
+        ...saved,
+        renderMode: 'cloud',
+      });
+    } else {
+      setActiveTab('create');
+    }
+  };
+
+  const handleDeleteCloudJob = async (
+    job: CloudJobRecord,
+    tempOnly: boolean
+  ) => {
+    await deleteCloudJobAndAssets(job.id, tempOnly);
+    if (!tempOnly && previewCloudJob?.id === job.id) {
+      setPreviewCloudJob(null);
+    }
+    await refreshCloudJobs();
+  };
+
   const hasActiveProject =
     currentProject.assets.length > 0 || Boolean(currentProject.edl);
-  const hasRenderedVideo = Boolean(renderedVideoUrl && currentProject.edl);
+  const hasRenderedVideo = Boolean(
+    (renderedVideoUrl && currentProject.edl) ||
+      previewCloudJob?.outputVideoSignedUrl ||
+      activeWorkspaceCloudJob?.outputVideoSignedUrl
+  );
+
+  const effectivePreviewCloudJob =
+    previewCloudJob ||
+    (activeWorkspaceCloudJob?.state === 'COMPLETED'
+      ? activeWorkspaceCloudJob
+      : null);
 
   return (
     <div className="min-h-screen flex flex-col bg-[#060B16] text-slate-100">
@@ -905,9 +1344,10 @@ export default function EditorApp() {
         activeTab={activeTab}
         onSelectTab={setActiveTab}
         onNewProject={handleStartNewProject}
-        onOpenSettings={() => setSettingsOpen(true)}
+        onOpenSettings={openSettingsModal}
         hasActiveProject={hasActiveProject}
         hasRenderedVideo={hasRenderedVideo}
+        hasActiveByokKey={hasActiveByokKey}
       />
 
       <main className="flex-1">
@@ -922,12 +1362,21 @@ export default function EditorApp() {
             >
               <DashboardView
                 projects={projects}
+                cloudConfigured={cloudConfigured}
+                cloudJobs={cloudJobs}
+                cloudJobsLoading={cloudJobsLoading}
+                onRefreshCloudJobs={refreshCloudJobs}
+                onPreviewCloudJob={handlePreviewCloudJob}
+                onRetryCloudJob={handleRetryCloudJob}
+                onCancelCloudJob={handleCancelCloudJob}
+                onResumeInterruptedUpload={handleResumeInterruptedUpload}
+                onDeleteCloudJob={handleDeleteCloudJob}
                 storageStats={storageStats}
                 onCreateNew={handleStartNewProject}
                 onOpenProject={handleOpenProject}
                 onDeleteProject={handleDeleteProject}
                 onClearAllStorage={handleClearAllStorage}
-                onOpenSettings={() => setSettingsOpen(true)}
+                onOpenSettings={openSettingsModal}
               />
             </motion.div>
           )}
@@ -960,6 +1409,14 @@ export default function EditorApp() {
                 onChangePreset={(preset) =>
                   setCurrentProject((p) => ({...p, preset}))
                 }
+                renderMode={
+                  currentProject.renderMode || settings.defaultRenderMode
+                }
+                onChangeRenderMode={(renderMode) =>
+                  setCurrentProject((p) => ({...p, renderMode}))
+                }
+                cloudConfigured={cloudConfigured}
+                onOpenSettings={openSettingsModal}
                 outputResolution={currentProject.outputResolution}
                 onChangeResolution={(outputResolution) =>
                   setCurrentProject((p) => ({...p, outputResolution}))
@@ -989,12 +1446,32 @@ export default function EditorApp() {
                 project={currentProject}
                 progress={progress}
                 isRunning={isPipelineRunning}
+                activeCloudJob={activeWorkspaceCloudJob}
                 onCancelRender={handleCancelRender}
+                onCancelCloudJob={async () => {
+                  if (activeWorkspaceCloudJob) {
+                    await handleCancelCloudJob(activeWorkspaceCloudJob);
+                  }
+                }}
                 onRetryFullPipeline={handleStartOneClickCreate}
                 onRetryRenderOnly={(force720p) =>
-                  handleRerenderFromEDL(undefined, force720p)
+                  void handleRerenderFromEDL(undefined, force720p)
                 }
-                onGoToPreview={() => setActiveTab('preview')}
+                onRetryCloudJob={async () => {
+                  if (activeWorkspaceCloudJob) {
+                    await handleRetryCloudJob(activeWorkspaceCloudJob);
+                  }
+                }}
+                onSwitchModeAndRender={(mode) =>
+                  void handleRerenderFromEDL(undefined, false, mode)
+                }
+                onGoToPreview={() => {
+                  if (activeWorkspaceCloudJob?.state === 'COMPLETED') {
+                    setPreviewCloudJob(activeWorkspaceCloudJob);
+                  }
+                  setActiveTab('preview');
+                }}
+                onOpenApiKeyManager={() => openSettingsModal('keys')}
               />
             </motion.div>
           )}
@@ -1008,9 +1485,11 @@ export default function EditorApp() {
               transition={{duration: 0.16}}
             >
               <FinalPreviewView
-                key={`${currentProject.id}_${currentProject.updatedAt}`}
+                key={`${currentProject.id}_${currentProject.updatedAt}_${effectivePreviewCloudJob?.id || 'local'}`}
                 project={currentProject}
                 videoUrl={renderedVideoUrl}
+                cloudJob={effectivePreviewCloudJob}
+                onRefreshCloudSignedUrl={handleRefreshPreviewSignedUrl}
                 onUpdateEDL={async (updatedEdl) => {
                   const next: ProjectRecord = {
                     ...currentProject,
@@ -1024,8 +1503,8 @@ export default function EditorApp() {
                 }}
                 onUploadAuxFile={handleUploadAuxFileInPreview}
                 onRemoveAuxFile={handleRemoveAsset}
-                onRerenderVideo={(edlOverride) =>
-                  handleRerenderFromEDL(edlOverride, false)
+                onRerenderVideo={(edlOverride, modeOverride) =>
+                  handleRerenderFromEDL(edlOverride, false, modeOverride)
                 }
                 onRegeneratePlan={handleRegeneratePlan}
                 isBusy={isPipelineRunning}
@@ -1037,16 +1516,25 @@ export default function EditorApp() {
 
       <footer className="hidden md:block border-t border-slate-800/70 py-5 px-8 text-xs text-slate-500">
         <div className="mx-auto max-w-7xl flex items-center justify-between">
-          <span>AI Shorts Editor · Personal Local Video Editing Assistant</span>
-          <span>Media stored locally in IndexedDB · Rendered in-browser via FFmpeg.wasm</span>
+          <span>
+            AI Shorts Editor · Private Single-User Video Editing Assistant
+          </span>
+          <span>
+            AES-GCM Encrypted BYOK Vault · Local FFmpeg.wasm &amp; Private Cloudflare R2/D1/Queue Worker
+          </span>
         </div>
       </footer>
 
       <SettingsModal
         open={settingsOpen}
+        initialTab={settingsTab}
         onClose={() => setSettingsOpen(false)}
         settings={settings}
         onSaveSettings={handleSaveSettings}
+        onKeysOrCloudChanged={() => {
+          void refreshByokIndicator();
+          void refreshCloudJobs();
+        }}
         deviceMemoryGB={deviceMemoryGB}
         storageStats={storageStats}
         onClearAllStorage={handleClearAllStorage}

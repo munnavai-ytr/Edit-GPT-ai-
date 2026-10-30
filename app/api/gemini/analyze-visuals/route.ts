@@ -26,7 +26,7 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({results: []});
     }
 
-    const ai = getServerGeminiClient();
+    const {ai} = getServerGeminiClient(req);
     const directorModel = resolveDirectorModel(rawModel);
 
     const parts: Array<

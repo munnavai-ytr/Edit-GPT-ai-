@@ -3,6 +3,8 @@
 import React, {useEffect, useRef, useState} from 'react';
 import {
   Check,
+  Cloud,
+  Cpu,
   Download,
   Music,
   RefreshCw,
@@ -18,6 +20,7 @@ import {formatBytes, formatDurationShort, formatTimecode} from '@/lib/format';
 import {
   CaptionPosition,
   CaptionStyleConfig,
+  CloudJobRecord,
   CropMode,
   EditDecisionList,
   EditingPresetId,
@@ -25,15 +28,21 @@ import {
   OutputAspectRatio,
   OutputResolution,
   ProjectRecord,
+  RenderMode,
 } from '@/lib/types';
 
 interface FinalPreviewViewProps {
   project: ProjectRecord;
   videoUrl: string | null;
+  cloudJob?: CloudJobRecord | null;
+  onRefreshCloudSignedUrl?: () => Promise<void>;
   onUpdateEDL: (updatedEdl: EditDecisionList) => Promise<void>;
   onUploadAuxFile: (role: MediaAssetRole, file: File) => Promise<string | null>;
   onRemoveAuxFile: (assetId: string) => Promise<void>;
-  onRerenderVideo: (overrideEdl?: EditDecisionList) => Promise<void>;
+  onRerenderVideo: (
+    overrideEdl?: EditDecisionList,
+    modeOverride?: RenderMode
+  ) => Promise<void>;
   onRegeneratePlan: (presetOverride?: EditingPresetId) => Promise<void>;
   isBusy: boolean;
 }
@@ -41,6 +50,8 @@ interface FinalPreviewViewProps {
 export default function FinalPreviewView({
   project,
   videoUrl,
+  cloudJob,
+  onRefreshCloudSignedUrl,
   onUpdateEDL,
   onUploadAuxFile,
   onRemoveAuxFile,
@@ -53,6 +64,7 @@ export default function FinalPreviewView({
   const [selectedPresetForRegen, setSelectedPresetForRegen] =
     useState<EditingPresetId>(project.preset);
   const [hasUnsavedEdits, setHasUnsavedEdits] = useState(false);
+  const [refreshingUrl, setRefreshingUrl] = useState(false);
 
   const musicInputRef = useRef<HTMLInputElement>(null);
   const watermarkInputRef = useRef<HTMLInputElement>(null);
@@ -93,7 +105,71 @@ export default function FinalPreviewView({
     container.appendChild(canvas);
   }, [draftEdl]);
 
+  const resolvedVideoSrc = cloudJob?.outputVideoSignedUrl || videoUrl;
+
   if (!draftEdl) {
+    if (cloudJob && cloudJob.outputVideoSignedUrl) {
+      const cloudFilename = `${(cloudJob.projectName || 'cloud-short')
+        .toLowerCase()
+        .replace(/[^a-z0-9-_]+/g, '-')}-${cloudJob.id.slice(-6)}.mp4`;
+
+      return (
+        <div className="mx-auto max-w-xl px-4 py-10 space-y-5 pb-28 md:pb-16">
+          <div className="rounded-2xl border border-slate-800/80 bg-[#0B1120] p-6 space-y-4">
+            <div className="flex items-baseline justify-between gap-2">
+              <h1 className="text-lg font-bold text-white truncate">
+                {cloudJob.projectName}
+              </h1>
+              <span className="text-xs font-mono text-emerald-400">
+                Cloud R2 MP4
+              </span>
+            </div>
+
+            <div className="flex items-center justify-center overflow-hidden rounded-xl border border-slate-800 bg-black">
+              <video
+                key={cloudJob.outputVideoSignedUrl}
+                src={cloudJob.outputVideoSignedUrl}
+                controls
+                playsInline
+                className="max-h-[620px] w-auto bg-black"
+              />
+            </div>
+
+            <div className="flex flex-col gap-2.5 sm:flex-row">
+              <a
+                href={cloudJob.outputVideoSignedUrl}
+                download={cloudFilename}
+                className="flex min-h-[46px] flex-1 items-center justify-center gap-2 rounded-xl bg-blue-600 px-5 py-3 text-sm font-bold text-white hover:bg-blue-500"
+              >
+                <Download className="h-4 w-4" />
+                <span>Download Cloud MP4</span>
+              </a>
+              {onRefreshCloudSignedUrl && (
+                <button
+                  type="button"
+                  disabled={refreshingUrl}
+                  onClick={async () => {
+                    setRefreshingUrl(true);
+                    try {
+                      await onRefreshCloudSignedUrl();
+                    } finally {
+                      setRefreshingUrl(false);
+                    }
+                  }}
+                  className="inline-flex min-h-[46px] items-center justify-center gap-1.5 rounded-xl border border-slate-700 px-4 py-3 text-xs font-medium text-slate-200 hover:bg-slate-800"
+                >
+                  <RefreshCw
+                    className={`h-3.5 w-3.5 ${refreshingUrl ? 'animate-spin' : ''}`}
+                  />
+                  <span>Refresh Signed Link</span>
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      );
+    }
+
     return (
       <div className="mx-auto max-w-4xl px-4 py-16 text-center">
         <p className="text-sm text-slate-400">
@@ -143,11 +219,11 @@ export default function FinalPreviewView({
     }));
   };
 
-  const handleApplyAndRerender = async () => {
+  const handleApplyAndRerender = async (modeOverride?: RenderMode) => {
     if (!draftEdl) return;
     await onUpdateEDL(draftEdl);
     setHasUnsavedEdits(false);
-    await onRerenderVideo(draftEdl);
+    await onRerenderVideo(draftEdl, modeOverride);
   };
 
   const musicAsset = project.assets.find(
@@ -181,10 +257,10 @@ export default function FinalPreviewView({
 
             {/* Video Container */}
             <div className="flex items-center justify-center overflow-hidden rounded-xl border border-slate-800 bg-black">
-              {videoUrl ? (
+              {resolvedVideoSrc ? (
                 <video
-                  key={videoUrl}
-                  src={videoUrl}
+                  key={resolvedVideoSrc}
+                  src={resolvedVideoSrc}
                   controls
                   playsInline
                   className={
@@ -201,34 +277,62 @@ export default function FinalPreviewView({
                     Video not rendered yet
                   </p>
                   <p className="mt-1 text-xs text-slate-500">
-                    Click Re-render Video to generate the MP4 file.
+                    Click Re-render Locally or Queue in Cloud to generate the MP4 file.
                   </p>
                 </div>
               )}
             </div>
 
             {/* Metadata Line */}
-            {project.renderedVideoMeta && (
-              <div className="flex flex-wrap items-center justify-center gap-x-2.5 gap-y-1 text-xs font-mono tabular-nums text-slate-400">
-                <span>H.264 + AAC</span>
+            {cloudJob?.outputVideoSignedUrl ? (
+              <div className="flex flex-wrap items-center justify-center gap-x-2.5 gap-y-1 text-xs font-mono tabular-nums text-emerald-400">
+                <span>Private R2 Signed Stream</span>
                 <span aria-hidden="true">·</span>
-                <span>
-                  {project.renderedVideoMeta.width}×
-                  {project.renderedVideoMeta.height}
-                </span>
-                <span aria-hidden="true">·</span>
-                <span>
-                  {formatDurationShort(project.renderedVideoMeta.duration)}
-                </span>
-                <span aria-hidden="true">·</span>
-                <span>{formatBytes(project.renderedVideoMeta.sizeBytes)}</span>
+                <span>10m Short-Lived URL</span>
+                {onRefreshCloudSignedUrl && (
+                  <>
+                    <span aria-hidden="true">·</span>
+                    <button
+                      type="button"
+                      disabled={refreshingUrl}
+                      onClick={async () => {
+                        setRefreshingUrl(true);
+                        try {
+                          await onRefreshCloudSignedUrl();
+                        } finally {
+                          setRefreshingUrl(false);
+                        }
+                      }}
+                      className="underline text-blue-300 hover:text-white"
+                    >
+                      {refreshingUrl ? 'Refreshing…' : 'Refresh URL'}
+                    </button>
+                  </>
+                )}
               </div>
+            ) : (
+              project.renderedVideoMeta && (
+                <div className="flex flex-wrap items-center justify-center gap-x-2.5 gap-y-1 text-xs font-mono tabular-nums text-slate-400">
+                  <span>H.264 + AAC</span>
+                  <span aria-hidden="true">·</span>
+                  <span>
+                    {project.renderedVideoMeta.width}×
+                    {project.renderedVideoMeta.height}
+                  </span>
+                  <span aria-hidden="true">·</span>
+                  <span>
+                    {formatDurationShort(project.renderedVideoMeta.duration)}
+                  </span>
+                  <span aria-hidden="true">·</span>
+                  <span>{formatBytes(project.renderedVideoMeta.sizeBytes)}</span>
+                </div>
+              )
             )}
 
             {/* Primary Download MP4 Action */}
-            {videoUrl && (
+            {resolvedVideoSrc && (
               <a
-                href={videoUrl}
+                href={resolvedVideoSrc}
                 download={safeFilename}
                 className="flex min-h-[48px] w-full items-center justify-center gap-2.5 rounded-xl bg-blue-600 px-5 py-3 text-sm font-bold text-white transition-colors hover:bg-blue-500 whitespace-nowrap"
               >
@@ -282,17 +386,30 @@ export default function FinalPreviewView({
                 </p>
               </div>
 
-              <button
-                type="button"
-                disabled={isBusy}
-                onClick={handleApplyAndRerender}
-                className="inline-flex min-h-[44px] items-center gap-2 rounded-xl bg-blue-600 px-5 py-2.5 text-xs font-bold text-white transition-colors hover:bg-blue-500 disabled:opacity-50 whitespace-nowrap shrink-0"
-              >
-                <RefreshCw className={`h-3.5 w-3.5 ${isBusy ? 'animate-spin' : ''}`} />
-                <span>
-                  {hasUnsavedEdits ? 'Apply & Re-render MP4' : 'Re-render Video'}
-                </span>
-              </button>
+              <div className="flex flex-wrap items-center gap-2 shrink-0">
+                <button
+                  type="button"
+                  disabled={isBusy}
+                  onClick={() => void handleApplyAndRerender('local')}
+                  className="inline-flex min-h-[42px] items-center gap-1.5 rounded-xl bg-blue-600 px-4 py-2 text-xs font-bold text-white transition-colors hover:bg-blue-500 disabled:opacity-50 whitespace-nowrap"
+                >
+                  <Cpu className="h-3.5 w-3.5" />
+                  <span>
+                    {hasUnsavedEdits
+                      ? 'Apply & Render Local'
+                      : 'Re-render Local'}
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  disabled={isBusy}
+                  onClick={() => void handleApplyAndRerender('cloud')}
+                  className="inline-flex min-h-[42px] items-center gap-1.5 rounded-xl border border-blue-500/40 bg-blue-950/25 px-4 py-2 text-xs font-semibold text-blue-200 transition-colors hover:bg-blue-600 hover:text-white disabled:opacity-50 whitespace-nowrap"
+                >
+                  <Cloud className="h-3.5 w-3.5" />
+                  <span>Queue Cloud Render</span>
+                </button>
+              </div>
             </div>
 
             {/* 1. Subtitle Style & Live Caption Preview */}

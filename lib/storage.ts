@@ -199,6 +199,7 @@ export const DEFAULT_APP_SETTINGS: AppSettings = {
   directorModel: 'gemini-3.8-flash',
   transcriptionModel: 'gemini-3.5-transcribe',
   defaultResolution: '1080p',
+  defaultRenderMode: 'local',
   autoLowMemoryFallback: true,
 };
 
@@ -210,11 +211,17 @@ export function loadAppSettings(): AppSettings {
     const parsed = JSON.parse(raw) as Partial<AppSettings>;
     return {
       directorModel:
-        parsed.directorModel === 'gemini-3.1-flash-lite'
-          ? 'gemini-3.1-flash-lite'
+        typeof parsed.directorModel === 'string' && parsed.directorModel.trim()
+          ? parsed.directorModel.trim()
           : 'gemini-3.8-flash',
-      transcriptionModel: 'gemini-3.5-transcribe',
+      transcriptionModel:
+        typeof parsed.transcriptionModel === 'string' &&
+        parsed.transcriptionModel.trim()
+          ? parsed.transcriptionModel.trim()
+          : 'gemini-3.5-transcribe',
       defaultResolution: parsed.defaultResolution === '720p' ? '720p' : '1080p',
+      defaultRenderMode:
+        parsed.defaultRenderMode === 'cloud' ? 'cloud' : 'local',
       autoLowMemoryFallback:
         typeof parsed.autoLowMemoryFallback === 'boolean'
           ? parsed.autoLowMemoryFallback

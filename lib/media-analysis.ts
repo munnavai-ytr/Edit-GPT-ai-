@@ -1,3 +1,4 @@
+import {buildGeminiAuthHeaders} from './gemini-client';
 import {
   AudioAuxAnalysisData,
   FontAnalysisData,
@@ -519,9 +520,10 @@ export async function analyzeAllProjectAssets(params: {
       0.65 + (start / Math.max(1, visionQueue.length)) * 0.35
     );
 
+    const headers = await buildGeminiAuthHeaders();
     const res = await fetch('/api/gemini/analyze-visuals', {
       method: 'POST',
-      headers: {'Content-Type': 'application/json'},
+      headers,
       body: JSON.stringify({
         items: batch,
         directorModel,

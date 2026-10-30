@@ -1,4 +1,5 @@
 import {MAX_VIDEO_DURATION_SECONDS} from './edl-validator';
+import {buildGeminiAuthHeaders} from './gemini-client';
 import {
   PauseInterval,
   TranscriptData,
@@ -164,9 +165,10 @@ export async function transcribeAndSyncVoiceover(params: {
       0.15 + (c / chunks.length) * 0.8
     );
 
+    const headers = await buildGeminiAuthHeaders();
     const res = await fetch('/api/gemini/transcribe', {
       method: 'POST',
-      headers: {'Content-Type': 'application/json'},
+      headers,
       body: JSON.stringify({
         audioBase64,
         mimeType: 'audio/wav',
